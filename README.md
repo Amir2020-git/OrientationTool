@@ -1,9 +1,11 @@
-# OrientationTool
+Average Misorientation — OVITO Python Modifier
 
-# Algorithm summary:
-# 1. Find the cutoff nearest neighbors
-# 2. Invoke the 2 orientation values for two neighbors in the form of quaternions
-# 3. Quaternion multiplications for calculating misorientation
-# 4. Apply 24 symmetry group to find the minimum misorientation
-# 5. Average of ~12 neighbors misorientation for each particle
-# 6. Adding this average_misorientation as a new property of the particle
+This OVITO Python modifier computes, for each particle, the average crystallographic misorientation (in degrees) to its cutoff neighbors, taking the minimum angle over the 24 proper rotations of the cubic point group. It then writes the result to a per-particle user property named average_misorientation.
+
+What it does?
+1. Finds neighbors within a user-set cutoff (default 3.5 Å)
+2. For each neighbor pair (i, j), reads quaternions from the Orientation property
+3. Computes misorientation by quaternion multiplication and applies all 24 cubic symmetries
+4. Takes the minimum angle over symmetries (in degrees)
+5. Averages the per-neighbor minima for each particle
+6. Stores the average in average_misorientation (special sentinel values optional)
