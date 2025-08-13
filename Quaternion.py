@@ -1,120 +1,106 @@
-#Algorithm summary:
-#1. Find the cutoff nearest neighbors
-#2. Invoke the 2 orientation values for two neighbors in the form of quaternions
-#3. Quaternion multiplications for calculating misorientation
-#4. Apply 24 symmetry group to find the minimum misorientation
-#5. Average of ~12 neighbors misorientation for each particle
-#6. Adding this average_misorientation as a new property of the particle
+# Algorithm summary:
+# 1) Find cutoff nearest neighbors
+# 2) Read two neighbors' orientations as quaternions
+# 3) Quaternion multiplication to get misorientation
+# 4) Apply 24 cubic symmetries; take the minimum misorientation
+# 5) Average ~12 neighbors per particle
+# 6) Write "average_misorientation" per particle
 
-
-from ovito.io import import_file, export_file
-from ovito.data import NearestNeighborFinder
 from ovito.data import CutoffNeighborFinder
-from ovito.data import *
-from ovito.modifiers import *
-from ovito.modifiers import PolyhedralTemplateMatchingModifier
+from ovito.modifiers import PolyhedralTemplateMatchingModifier  # kept for context; Orientation must exist upstream
 import numpy as np
-from numpy import linalg as LA
 import math
-#from pyquaternion import *
 
+# 24 proper rotations of the cubic point group (unit quaternions w, x, y, z)
+CUBIC_SYM = np.array([
+    [1.0, 0.0, 0.0, 0.0],
+    [0.5,  0.5,  0.5,  0.5],
+    [0.5, -0.5, -0.5, -0.5],
+    [0.5, -0.5,  0.5,  0.5],
+    [0.5,  0.5, -0.5,  0.5],
+    [0.5,  0.5,  0.5, -0.5],
+    [0.5, -0.5, -0.5,  0.5],
+    [0.5,  0.5, -0.5, -0.5],
+    [0.5, -0.5,  0.5, -0.5],
+    [0.0,  0.0,  1.0,  0.0],
+    [0.0,  0.0,  0.0,  1.0],
+    [0.0,  1.0,  0.0,  0.0],
+    [0.0,  0.707106781186548, 0.0, -0.707106781186548],
+    [0.0,  0.707106781186548, 0.0,  0.707106781186548],
+    [0.707106781186548, 0.0,  0.707106781186548, 0.0],
+    [0.707106781186548, 0.0, -0.707106781186548, 0.0],
+    [0.0,  0.0,  0.707106781186548, -0.707106781186548],
+    [0.707106781186548, 0.707106781186548, 0.0, 0.0],
+    [0.707106781186548,-0.707106781186548, 0.0, 0.0],
+    [0.0,  0.0,  0.707106781186548, 0.707106781186548],
+    [0.0,  0.707106781186548, -0.707106781186548, 0.0],
+    [0.707106781186548, 0.0, 0.0, -0.707106781186548],
+    [0.0,  0.707106781186548,  0.707106781186548, 0.0],
+    [0.707106781186548, 0.0, 0.0,  0.707106781186548]
+], dtype=float)
 
-# Load input simulation file.
-#node = import_file("dump.sig3_minimization_AfterFix_0.cfg")
-#data = node.source
+# Fixed reordering and conjugation (to match your original convention)
+_REORDER = (3, 0, 1, 2)          # map input (w,x,y,z?) into expected order
+_CONJ    = np.array([1, -1, -1, -1], dtype=float)
 
-#Defining 24 symmetry groups
-cubic_gcs = np.array([
-[		 1,			 0,			 0,			 0],
-[0.500000000000000,	 0.500000000000000,	 0.500000000000000,	 0.500000000000000],
-[0.500000000000000,	-0.500000000000000,	-0.500000000000000,	-0.500000000000000],
-[0.500000000000000,	-0.500000000000000,	 0.500000000000000,	 0.500000000000000],
-[0.500000000000000,	 0.500000000000000,	-0.500000000000000,	 0.500000000000000],
-[0.500000000000000,	 0.500000000000000,	 0.500000000000000,	-0.500000000000000],
-[0.500000000000000,	-0.500000000000000,	-0.500000000000000,	 0.500000000000000],
-[0.500000000000000,	 0.500000000000000,	-0.500000000000000,	-0.500000000000000],
-[0.500000000000000,	-0.500000000000000,	 0.500000000000000,	-0.500000000000000],
-[		 0,			 0,			 1,			 0],
-[		 0,			 0,		 	 0,			 1],
-[		 0,			 1,			 0,			 0],
-[		 0,	 0.707106781186548,			 0,	-0.707106781186548],
-[		 0,	 0.707106781186548,			 0,	 0.707106781186548],
-[0.707106781186548,			 0,	 0.707106781186548,	 		 0],
-[0.707106781186548,			 0,	-0.707106781186548,			 0],
-[		 0,			 0,	 0.707106781186548,	-0.707106781186548],
-[0.707106781186548,	 0.707106781186548,			 0,			 0],
-[0.707106781186548,	-0.707106781186548,			 0,			 0],
-[		 0,			 0,	 0.707106781186548,	 0.707106781186548],
-[		 0,	 0.707106781186548,	-0.707106781186548,			 0],
-[0.707106781186548,	 		 0,			 0,	-0.707106781186548],
-[		 0,	 0.707106781186548,	 0.707106781186548,			 0],
-[0.707106781186548,			 0,			 0,	 0.707106781186548]
-])
+def _quat_mul(a, b):
+    """Hamilton product of quaternions a*b, each as [w,x,y,z]."""
+    w0, x0, y0, z0 = a
+    w1, x1, y1, z1 = b
+    return np.array([
+        w0*w1 - x0*x1 - y0*y1 - z0*z1,
+        w0*x1 + x0*w1 + y0*z1 - z0*y1,
+        w0*y1 - x0*z1 + y0*w1 + z0*x1,
+        w0*z1 + x0*y1 - y0*x1 + z0*w1
+    ], dtype=float)
 
-xyz = np.copy(cubic_gcs)
+def _misorientation_deg(q, h):
+    """Minimum misorientation angle (degrees) over 24 cubic symmetries for pair q,h."""
+    # Reorder and conjugate as in your original
+    r = np.array([q[j] for j in _REORDER], dtype=float) * _CONJ
+    a = np.array([h[j] for j in _REORDER], dtype=float)
+    b = _quat_mul(r, a)
+    # Apply the 24 symmetry operators on the left: d = c * b
+    d0_vals = []
+    for c in CUBIC_SYM:
+        d = _quat_mul(c, b)
+        d0_vals.append(d[0])
+    # Clamp to avoid numeric domain errors in arccos
+    d0_max = np.clip(np.max(d0_vals), -1.0, 1.0)  # max(d0) minimizes angle
+    theta = 2.0 * math.acos(d0_max)
+    return math.degrees(theta)
 
-def modify(frame, data , output):
-	cutoff=3.5
-	finder = CutoffNeighborFinder (cutoff, data)
-	# Loop over all input particles:
-	for index in range(data.number_of_particles):
-		min_degree_list=[]
-		print("Cutoff neighbors of particle %i:" % index)
-		# Iterate over the neighbors of the current particle, starting with the closest:
-		for neigh in finder.find(index):
+def modify(frame, data, output):
+    cutoff = 3.5
+    finder = CutoffNeighborFinder(cutoff, data)
 
-			q=output.particle_properties['Orientation'].marray[index]
-			h=output.particle_properties['Orientation'].marray[neigh.index]
-		
-			conj=np.array([1, -1, -1, -1])
-			#reordering the quaternions
-			myorder = [3, 0, 1, 2]
-			q_reordered = [q[j] for j in myorder]
-			h_reordered = [h[s] for s in myorder]
+    # Orientation must exist (typically provided by PolyhedralTemplateMatchingModifier upstream)
+    if 'Orientation' not in output.particle_properties:
+        raise RuntimeError("Orientation property not found. "
+                           "Apply PolyhedralTemplateMatchingModifier before this modifier.")
 
-			#conj=np.array([-1, -1, -1, 1])
-			r=np.multiply(q_reordered,conj)
-			#r=q
-			a=h_reordered
-			#product=(r*a)
-			b0 = r[0] * a[0] - r[1] * a[1] - r[2] * a[2] - r[3] * a[3]
-			b1 = r[0] * a[1] + r[1] * a[0] + r[2] * a[3] - r[3] * a[2]
-			b2 = r[0] * a[2] - r[1] * a[3] + r[2] * a[0] + r[3] * a[1]
-			b3 = r[0] * a[3] + r[1] * a[2] - r[2] * a[1] + r[3] * a[0]
-			b=np.array([b0, b1, b2, b3])
-			thetaList=[]
-			# apply 24 symmetry group
-			for i in range (24):
-				c=xyz[i]
-				#product=(c*b)
-				d0 = c[0] * b[0] - c[1] * b[1] - c[2] * b[2] - c[3] * b[3]
-				d1 = c[0] * b[1] + c[1] * b[0] + c[2] * b[3] - c[3] * b[2]
-				d2 = c[0] * b[2] - c[1] * b[3] + c[2] * b[0] + c[3] * b[1]
-				d3 = c[0] * b[3] + c[1] * b[2] - c[2] * b[1] + c[3] * b[0]
-				d=np.array([d0, d1, d2, d3])
-				#if d0>1 or d0<-1:
-					#print('d0 = ',d0)
-				d0_limited=np.clip(d0,-1,1)
-				theta=2.0*np.arccos(d0_limited)
-				thetaDegree=math.degrees(theta)
+    orientations = output.particle_properties['Orientation'].marray
+    n = data.number_of_particles
 
-				thetaList.append(thetaDegree)
-				#print(i, thetaDegree)
-				#print(d0,d0_limited)
-			minDegree=min(thetaList)
-			min_degree_list.append(minDegree)
-			#print(thetaList)
-			print(minDegree)
-			
-		#print(min_degree_list)
-		average_minDegree=np.average(min_degree_list)
-		
-		if average_minDegree > 15:
-			average_minDegree=15000
-		elif average_minDegree > 3 and average_minDegree <= 15:
-			average_minDegree=3000
-		
-		print('average misoriention = ',average_minDegree)
-		fundamental_property = output.create_user_particle_property("average_misorientation", "float").marray
-		fundamental_property[index] = average_minDegree
+    # Create result property once and fill it
+    avg_prop = output.create_user_particle_property("average_misorientation", "float").marray
 
+    for index in range(n):
+        theta_degs = []
+        for neigh in finder.find(index):
+            q = orientations[index]
+            h = orientations[neigh.index]
+            theta_degs.append(_misorientation_deg(q, h))
+
+        if not theta_degs:
+            avg_deg = float('nan')  # no neighbors within cutoff
+        else:
+            avg_deg = float(np.mean(theta_degs))
+
+        # Map to your sentinel values, preserving your thresholds
+        if avg_deg > 15:
+            avg_prop[index] = 15000.0
+        elif 3 < avg_deg <= 15:
+            avg_prop[index] = 3000.0
+        else:
+            avg_prop[index] = avg_deg
